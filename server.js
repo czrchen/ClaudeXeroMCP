@@ -19,9 +19,11 @@ require('dotenv').config();
 const express        = require('express');
 const axios          = require('axios');
 const crypto         = require('crypto');
+const { spawn }      = require('child_process');
 const { neon }       = require('@neondatabase/serverless');
 
-const sql = neon(process.env.DATABASE_URL);
+// sql is initialised in the startup IIFE after we verify DATABASE_URL is present
+let sql;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -62,6 +64,10 @@ const SCOPES = process.env.XERO_SCOPES ||
 const XERO_AUTH_URL  = 'https://login.xero.com/identity/connect/authorize';
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token';
 const XERO_CONN_URL  = 'https://api.xero.com/connections';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null);
+const MCP_MESSAGE_PATH = '/message';
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 
 // ── Token storage (NeonDB) ───────────────────────────────────────────────────
 
@@ -159,9 +165,13 @@ async function refreshIfNeeded() {
 // ── Express app ───────────────────────────────────────────────────────────────
 
 const app = express();
+app.set('trust proxy', true);
 
 // In-memory CSRF state (fine for local single-user app)
 let oauthState = null;
+
+// Active remote MCP sessions keyed by the SSE session ID Claude receives.
+const mcpSessions = new Map();
 
 // ── GET / — Home: show token status ──────────────────────────────────────────
 
@@ -197,13 +207,14 @@ app.get('/', async (req, res) => {
   const token     = tokens.access_token;
   const tenantId  = tokens.tenant_id  || '';
   const orgName   = tokens.tenant_name || 'Unknown Org';
+  const remoteMcpUrl = `${getPublicBaseUrl(req)}/sse${MCP_AUTH_TOKEN ? `?token=${encodeURIComponent(MCP_AUTH_TOKEN)}` : ''}`;
 
   // Build Claude Desktop MCP config
   const mcpConfig = JSON.stringify({
     mcpServers: {
       xero: {
         command: 'npx',
-        args: ['-y', 'xero-mcp-server'],
+        args: ['-y', '@xeroapi/xero-mcp-server'],
         env: {
           XERO_CLIENT_ID:           CLIENT_ID,
           XERO_CLIENT_SECRET:       CLIENT_SECRET,
@@ -235,6 +246,12 @@ app.get('/', async (req, res) => {
           <button class="copy-btn" onclick="copy('tenantId', this)">Copy</button>
         </div>
 
+        <label class="field-label" style="margin-top:26px">Claude.ai Remote MCP URL</label>
+        <div class="token-wrap">
+          <code id="remoteMcpUrl">${esc(remoteMcpUrl)}</code>
+          <button class="copy-btn" onclick="copy('remoteMcpUrl', this)">Copy</button>
+        </div>
+
         <label class="field-label" style="margin-top:26px">Ready-to-paste Claude Desktop MCP Config</label>
         <div class="config-wrap">
           <pre id="mcpConfig">${esc(mcpConfig)}</pre>
@@ -250,10 +267,11 @@ app.get('/', async (req, res) => {
 
       <div class="info-box">
         <strong>📋 How to use:</strong>
-        Copy the MCP Config JSON above → open <code>~/.claude/claude_desktop_config.json</code>
+        For Claude.ai on Railway, add the Remote MCP URL above as your custom connector URL.
+        For Claude Desktop, copy the MCP Config JSON above → open <code>~/.claude/claude_desktop_config.json</code>
         → paste/merge the <code>mcpServers</code> block → restart Claude Desktop.<br>
         Tokens expire every <strong>30 min</strong>. This page auto-refreshes them on load.
-        When MCP stops working: revisit here, copy fresh token, update config, restart Claude Desktop.
+        Remote MCP sessions close shortly before token expiry so Claude can reconnect with a fresh token.
       </div>`,
   }));
 });
@@ -471,6 +489,247 @@ app.get('/api/token', async (req, res) => {
   });
 });
 
+// ── Remote MCP bridge for Claude.ai / Railway ────────────────────────────────
+//
+// Claude connects to GET /sse and keeps that EventSource open. The endpoint
+// event tells Claude where to POST JSON-RPC messages. Each SSE connection owns
+// one xero-mcp-server subprocess, and this app bridges HTTP+SSE <-> stdio.
+
+app.get('/sse', async (req, res) => {
+  if (!isMcpAuthorized(req)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const tokens = await refreshIfNeeded();
+  if (!tokens) {
+    return res.status(401).send('Xero is not authenticated. Visit /login first.');
+  }
+
+  let session;
+  try {
+    session = createMcpSession(tokens);
+  } catch (err) {
+    console.error('[mcp-bridge] Failed to start xero-mcp-server:', err.message);
+    return res.status(500).send('Failed to start Xero MCP server');
+  }
+
+  session.res = res;
+  mcpSessions.set(session.id, session);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const endpointUrl = new URL(MCP_MESSAGE_PATH, 'http://localhost');
+  endpointUrl.searchParams.set('sessionId', session.id);
+  res.write(`event: endpoint\ndata: ${endpointUrl.pathname + endpointUrl.search}\n\n`);
+
+  session.heartbeat = setInterval(() => {
+    if (!session.closed && !res.writableEnded) {
+      res.write(': keepalive\n\n');
+    }
+  }, 25_000);
+
+  const refreshDelay = tokens.expires_at - Date.now() - 60_000;
+  session.tokenExpiryTimer = setTimeout(() => {
+    closeMcpSession(session, 'Xero token is nearing expiry; Claude should reconnect');
+  }, Math.max(refreshDelay, 5_000));
+
+  req.on('close', () => {
+    closeMcpSession(session, 'SSE client disconnected');
+  });
+
+  console.log(`[mcp-bridge] SSE session ${session.id} started for ${tokens.tenant_name || tokens.tenant_id || 'Xero tenant'}`);
+});
+
+const mcpJsonBody = express.json({ limit: '4mb', type: 'application/json' });
+
+app.post(MCP_MESSAGE_PATH, mcpJsonBody, handleMcpPost);
+app.post('/messages', mcpJsonBody, handleMcpPost);
+
+async function handleMcpPost(req, res) {
+  const sessionId = String(req.query.sessionId || '');
+  if (!sessionId) {
+    return res.status(400).send('Missing sessionId parameter');
+  }
+
+  const session = mcpSessions.get(sessionId);
+  if (!session || session.closed) {
+    return res.status(404).send('Session not found');
+  }
+
+  const pendingIds = getJsonRpcIds(req.body);
+  for (const id of pendingIds) {
+    session.pendingRequestIds.add(id);
+  }
+
+  try {
+    await writeJsonRpcToChild(session, req.body);
+    return res.status(202).send('Accepted');
+  } catch (err) {
+    for (const id of pendingIds) {
+      session.pendingRequestIds.delete(id);
+    }
+    console.error(`[mcp-bridge] Failed to forward message for session ${session.id}:`, err.message);
+    return res.status(500).send('Failed to forward message to Xero MCP server');
+  }
+}
+
+function createMcpSession(tokens) {
+  const id = crypto.randomUUID();
+  const child = spawn(process.execPath, [require.resolve('@xeroapi/xero-mcp-server')], {
+    env: {
+      ...process.env,
+      XERO_CLIENT_ID:           CLIENT_ID,
+      XERO_CLIENT_SECRET:       CLIENT_SECRET,
+      XERO_CLIENT_BEARER_TOKEN: tokens.access_token,
+      XERO_TENANT_ID:           tokens.tenant_id || '',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const session = {
+    id,
+    child,
+    res: null,
+    stdoutBuffer: '',
+    pendingRequestIds: new Set(),
+    heartbeat: null,
+    tokenExpiryTimer: null,
+    closed: false,
+  };
+
+  child.stdout.on('data', chunk => handleChildStdout(session, chunk));
+  child.stderr.on('data', chunk => {
+    const text = chunk.toString('utf8').trimEnd();
+    if (text) console.error(`[xero-mcp:${id}] ${text}`);
+  });
+  child.on('error', err => {
+    console.error(`[mcp-bridge] xero-mcp-server error for session ${id}:`, err.message);
+    sendPendingErrors(session, 'Xero MCP server failed to start');
+    closeMcpSession(session, 'xero-mcp-server failed', { killChild: false });
+  });
+  child.on('close', (code, signal) => {
+    if (!session.closed) {
+      console.error(`[mcp-bridge] xero-mcp-server exited for session ${id}: code=${code} signal=${signal || 'none'}`);
+      sendPendingErrors(session, 'Xero MCP server exited before responding');
+      closeMcpSession(session, 'xero-mcp-server exited', { killChild: false });
+    }
+  });
+
+  return session;
+}
+
+function handleChildStdout(session, chunk) {
+  session.stdoutBuffer += chunk.toString('utf8');
+
+  let newlineIndex = session.stdoutBuffer.indexOf('\n');
+  while (newlineIndex !== -1) {
+    const line = session.stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+    session.stdoutBuffer = session.stdoutBuffer.slice(newlineIndex + 1);
+
+    if (line.trim()) {
+      try {
+        const message = JSON.parse(line);
+        for (const id of getJsonRpcIds(message)) {
+          session.pendingRequestIds.delete(id);
+        }
+        sendSseMessage(session, message);
+      } catch (err) {
+        console.error(`[mcp-bridge] Ignoring non-JSON stdout from xero-mcp-server (${session.id}):`, line);
+      }
+    }
+
+    newlineIndex = session.stdoutBuffer.indexOf('\n');
+  }
+}
+
+function writeJsonRpcToChild(session, message) {
+  return new Promise((resolve, reject) => {
+    if (session.closed || !session.child.stdin.writable) {
+      reject(new Error('xero-mcp-server stdin is closed'));
+      return;
+    }
+
+    const line = JSON.stringify(message) + '\n';
+    let settled = false;
+    const finish = err => {
+      if (settled) return;
+      settled = true;
+      session.child.stdin.off('error', finish);
+      if (err) reject(err);
+      else resolve();
+    };
+
+    session.child.stdin.once('error', finish);
+    session.child.stdin.write(line, finish);
+  });
+}
+
+function sendSseMessage(session, message) {
+  if (session.closed || !session.res || session.res.writableEnded) return;
+  session.res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+}
+
+function sendPendingErrors(session, message) {
+  for (const id of session.pendingRequestIds) {
+    sendSseMessage(session, {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32000, message },
+    });
+  }
+  session.pendingRequestIds.clear();
+}
+
+function closeMcpSession(session, reason, options = {}) {
+  if (session.closed) return;
+  session.closed = true;
+
+  if (session.heartbeat) clearInterval(session.heartbeat);
+  if (session.tokenExpiryTimer) clearTimeout(session.tokenExpiryTimer);
+  mcpSessions.delete(session.id);
+
+  if (session.res && !session.res.writableEnded) {
+    session.res.end();
+  }
+
+  if (options.killChild !== false && session.child.exitCode === null && !session.child.killed) {
+    session.child.kill('SIGTERM');
+    const forceKill = setTimeout(() => {
+      if (session.child.exitCode === null && !session.child.killed) {
+        session.child.kill('SIGKILL');
+      }
+    }, 5_000);
+    forceKill.unref?.();
+  }
+
+  console.log(`[mcp-bridge] SSE session ${session.id} closed: ${reason}`);
+}
+
+function getJsonRpcIds(message) {
+  const messages = Array.isArray(message) ? message : [message];
+  return messages
+    .filter(item => item && typeof item === 'object' && Object.prototype.hasOwnProperty.call(item, 'id'))
+    .map(item => item.id);
+}
+
+function isMcpAuthorized(req) {
+  if (!MCP_AUTH_TOKEN) return true;
+
+  const authHeader = req.get('authorization') || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  return bearerToken === MCP_AUTH_TOKEN || req.query.token === MCP_AUTH_TOKEN;
+}
+
+function getPublicBaseUrl(req) {
+  const baseUrl = PUBLIC_BASE_URL || `${req.protocol}://${req.get('host') || `localhost:${PORT}`}`;
+  return baseUrl.replace(/\/+$/, '');
+}
+
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 /** Escape HTML special chars */
@@ -638,6 +897,14 @@ function renderPage({ title, content }) {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 (async () => {
+  // Verify DATABASE_URL is present before doing anything
+  if (!process.env.DATABASE_URL) {
+    console.error('[xero-auth] FATAL: DATABASE_URL environment variable is not set.');
+    process.exit(1);
+  }
+
+  sql = neon(process.env.DATABASE_URL);
+
   // Create the DB table if it doesn't exist yet, then start the server
   await initDb();
   console.log('[xero-auth] Database ready (NeonDB)');
@@ -652,6 +919,7 @@ function renderPage({ title, content }) {
     } else {
       console.log('  → Open http://localhost:' + PORT + ' in your browser to get your token');
       console.log('  → JSON API: GET http://localhost:' + PORT + '/api/token');
+      console.log('  → Remote MCP: GET http://localhost:' + PORT + '/sse, POST http://localhost:' + PORT + MCP_MESSAGE_PATH);
     }
     console.log('');
   });

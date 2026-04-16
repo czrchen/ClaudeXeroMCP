@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
+    "@xeroapi/xero-mcp-server": "^0.0.14",
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2"
