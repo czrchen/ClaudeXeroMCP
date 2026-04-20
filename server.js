@@ -170,8 +170,56 @@ app.set('trust proxy', true);
 // In-memory CSRF state (fine for local single-user app)
 let oauthState = null;
 
+// Holds already-exchanged OAuth tokens while the user chooses a Xero org.
+const pendingTenantSelections = new Map();
+const PENDING_TENANT_SELECTION_TTL_MS = 10 * 60 * 1000;
+
 // Active remote MCP sessions keyed by the SSE session ID Claude receives.
 const mcpSessions = new Map();
+
+function createPendingTenantSelection(data) {
+  const id = crypto.randomUUID();
+  pendingTenantSelections.set(id, {
+    ...data,
+    created_at: Date.now(),
+  });
+
+  const timer = setTimeout(() => {
+    pendingTenantSelections.delete(id);
+  }, PENDING_TENANT_SELECTION_TTL_MS);
+
+  if (typeof timer.unref === 'function') timer.unref();
+  return id;
+}
+
+function getPendingTenantSelection(id) {
+  const pending = pendingTenantSelections.get(id);
+  if (!pending) return null;
+
+  if (Date.now() - pending.created_at > PENDING_TENANT_SELECTION_TTL_MS) {
+    pendingTenantSelections.delete(id);
+    return null;
+  }
+
+  return pending;
+}
+
+async function saveSelectedTenant(selection, tenantId) {
+  const tenant = selection.tenants.find(t => t.tenantId === tenantId) || selection.tenants[0];
+
+  await saveTokens({
+    access_token:  selection.access_token,
+    refresh_token: selection.refresh_token,
+    expires_at:    selection.expires_at,
+    tenant_id:     tenant.tenantId,
+    tenant_name:   tenant.tenantName,
+    authorised_at: new Date().toISOString(),
+    refreshed_at:  null,
+  });
+
+  console.log(`[xero-auth] Authorised: ${tenant.tenantName} (${tenant.tenantId})`);
+  return tenant;
+}
 
 // ── GET / — Home: show token status ──────────────────────────────────────────
 
@@ -355,6 +403,7 @@ app.get('/callback', async (req, res) => {
     );
 
     const { access_token, refresh_token, expires_in } = tokenRes.data;
+    const expires_at = Date.now() + expires_in * 1000;
 
     // ── Step 2: Fetch connected orgs to get tenant ID ─────────────────────
     const connRes = await axios.get(XERO_CONN_URL, {
@@ -377,6 +426,13 @@ app.get('/callback', async (req, res) => {
 
     // If multiple orgs, show a picker
     if (tenants.length > 1 && !req.query.tenant_id) {
+      const selectionId = createPendingTenantSelection({
+        access_token,
+        refresh_token,
+        expires_at,
+        tenants,
+      });
+
       return res.send(renderPage({
         title: 'Select Organisation',
         content: `
@@ -386,7 +442,7 @@ app.get('/callback', async (req, res) => {
               Multiple organisations found. Choose which one to use with Claude Desktop MCP.
             </p>
             ${tenants.map(t => `
-              <a href="/callback?code=${esc(String(code))}&state=${esc(String(req.query.state || ''))}&tenant_id=${esc(t.tenantId)}"
+              <a href="${esc(`/select-tenant?selection=${encodeURIComponent(selectionId)}&tenant_id=${encodeURIComponent(t.tenantId)}`)}"
                  class="org-item">
                 🏢 <strong>${esc(t.tenantName)}</strong>
                 <span style="font-size:11px;color:#888;margin-left:8px">${esc(t.tenantId)}</span>
@@ -396,22 +452,12 @@ app.get('/callback', async (req, res) => {
       }));
     }
 
-    // Use requested tenant or first one
-    const selectedId = req.query.tenant_id || tenants[0].tenantId;
-    const tenant     = tenants.find(t => t.tenantId === selectedId) || tenants[0];
-
-    // ── Step 3: Save tokens ───────────────────────────────────────────────
-    await saveTokens({
+    await saveSelectedTenant({
       access_token,
       refresh_token,
-      expires_at:   Date.now() + expires_in * 1000,
-      tenant_id:    tenant.tenantId,
-      tenant_name:  tenant.tenantName,
-      authorised_at: new Date().toISOString(),
-      refreshed_at:  null,
-    });
-
-    console.log(`[xero-auth] Authorised: ${tenant.tenantName} (${tenant.tenantId})`);
+      expires_at,
+      tenants,
+    }, String(req.query.tenant_id || tenants[0].tenantId));
 
     res.redirect('/?connected=1');
 
@@ -433,6 +479,43 @@ app.get('/callback', async (req, res) => {
       </div>`,
     }));
   }
+});
+
+// ── GET /select-tenant — Save org chosen after OAuth callback ────────────────
+
+app.get('/select-tenant', async (req, res) => {
+  const selectionId = String(req.query.selection || '');
+  const tenantId    = String(req.query.tenant_id || '');
+  const selection   = getPendingTenantSelection(selectionId);
+
+  if (!selection || !tenantId) {
+    return res.status(400).send(renderPage({
+      title: 'Selection Expired',
+      content: `<div class="card center">
+        <div class="icon">🚫</div>
+        <h2>Organisation selection expired</h2>
+        <p>Please re-authorise Xero and choose the organisation again.</p>
+        <a href="/login" class="btn">Retry</a>
+      </div>`,
+    }));
+  }
+
+  const tenant = selection.tenants.find(t => t.tenantId === tenantId);
+  if (!tenant) {
+    return res.status(400).send(renderPage({
+      title: 'Unknown Organisation',
+      content: `<div class="card center">
+        <div class="icon">⚠️</div>
+        <h2>Unknown organisation</h2>
+        <p>The selected Xero organisation was not found in this authorisation session.</p>
+        <a href="/login" class="btn">Try again</a>
+      </div>`,
+    }));
+  }
+
+  await saveSelectedTenant(selection, tenantId);
+  pendingTenantSelections.delete(selectionId);
+  res.redirect('/?connected=1');
 });
 
 // ── GET /refresh — Force token refresh ───────────────────────────────────────
